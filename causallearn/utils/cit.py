@@ -1,11 +1,33 @@
 import os, json, codecs, time, hashlib
 import numpy as np
+import pandas as pd
 from math import log, sqrt
 from collections.abc import Iterable
 from scipy.stats import chi2, norm
 
 from causallearn.utils.KCI.KCI import KCI_CInd, KCI_UInd
 from causallearn.utils.PCUtils import Helper
+
+#
+from pydantic import BaseModel
+from typing import List, Optional
+
+
+class IFieldMeta(BaseModel):
+    ''' 'quantitative' | 'nominal'  | 'ordinal'   | 'temporal'
+         float64 or int| int or str | int or str  | datetime64
+
+    nominal: one-hot encoding + chi2/g2
+    ordinal: turn to quantitative
+    temporal: turn to quantitative  无起点
+    quantitative: pearson   fisher-z
+    '''
+    fid: str
+    name: Optional[str]
+    semanticType: str
+
+
+#
 
 CONST_BINCOUNT_UNIQUE_THRESHOLD = 1e5
 NO_SPECIFIED_PARAMETERS_MSG = "NO SPECIFIED PARAMETERS"
@@ -16,6 +38,7 @@ kci = "kci"
 chisq = "chisq"
 gsq = "gsq"
 d_separation = "d_separation"
+adaptive = "adaptive"
 
 
 def CIT(data, method='fisherz', **kwargs):
@@ -40,8 +63,13 @@ def CIT(data, method='fisherz', **kwargs):
         return MC_FisherZ(data, **kwargs)
     elif method == d_separation:
         return D_Separation(data, **kwargs)
+    elif method == adaptive:
+        # CIT传入的data是np.ndarray
+        data = pd.DataFrame(data, columns=[f'f{i}' for i in range(data.shape[1])])
+        return AdaptiveCIT(data, None, **kwargs)
     else:
         raise ValueError("Unknown method: {}".format(method))
+
 
 class CIT_Base(object):
     # Base class for CIT, contains basic operations for input check and caching, etc.
@@ -64,17 +92,19 @@ class CIT_Base(object):
         if cache_path is not None:
             assert cache_path.endswith('.json'), "Cache must be stored as .json file."
             if os.path.exists(cache_path):
-                with codecs.open(cache_path, 'r') as fin: self.pvalue_cache = json.load(fin)
+                with codecs.open(cache_path, 'r') as fin:
+                    self.pvalue_cache = json.load(fin)
                 assert self.pvalue_cache['data_hash'] == self.data_hash, "Data hash mismatch."
-            else: os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            else:
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
 
     def check_cache_method_consistent(self, method_name, parameters_hash):
         self.method = method_name
         if method_name not in self.pvalue_cache:
-            self.pvalue_cache['method_name'] = method_name # a newly created cache
+            self.pvalue_cache['method_name'] = method_name  # a newly created cache
             self.pvalue_cache['parameters_hash'] = parameters_hash
         else:
-            assert self.pvalue_cache['method_name'] == method_name, "CI test method name mismatch." # a loaded cache
+            assert self.pvalue_cache['method_name'] == method_name, "CI test method name mismatch."  # a loaded cache
             assert self.pvalue_cache['parameters_hash'] == parameters_hash, "CI test method parameters mismatch."
 
     def assert_input_data_is_valid(self, allow_nan=False, allow_inf=False):
@@ -107,11 +137,12 @@ class CIT_Base(object):
         condition_set: List<int>
         cache_key: string. Unique for <X,Y|S> in any input type or order.
         '''
+
         def _stringize(ulist1, ulist2, clist):
             # ulist1, ulist2, clist: list of ints, sorted.
-            _strlst  = lambda lst: '.'.join(map(str, lst))
+            _strlst = lambda lst: '.'.join(map(str, lst))
             return f'{_strlst(ulist1)};{_strlst(ulist2)}|{_strlst(clist)}' if len(clist) > 0 else \
-                   f'{_strlst(ulist1)};{_strlst(ulist2)}'
+                f'{_strlst(ulist1)};{_strlst(ulist2)}'
 
         # every time when cit is called, auto save to local cache.
         self.save_to_local_cache()
@@ -135,12 +166,105 @@ class CIT_Base(object):
                len(set(Ys).intersection(condition_set)) == 0, "X, Y cannot be in condition_set."
         return Xs, Ys, condition_set, _stringize(Xs, Ys, condition_set)
 
+
+class AdaptiveCIT:
+    def __init__(self, data: pd.DataFrame, fields: List[IFieldMeta] = None, **kwargs):
+        self.fields = self.auto_type(data) if fields is None else fields
+        self.data = data
+        self.discrete, self.continuous = self.trans(data)
+        self.kwargs = kwargs
+        self.method = adaptive
+        self.prefer = 'discrete'  # 'discrete' or 'continuous'
+
+        print(self.fields)
+
+    def trans(self, data: pd.DataFrame):
+        discrete, continuous = None, None
+        for i in range(len(data.columns)):
+            label = self.fields[i].fid
+            if self.fields[i].semanticType == 'quantitative':
+                continuous = pd.concat([continuous, data[label]], axis=1)
+                cut = pd.cut(data[label], 16).rename(label)
+                discrete = pd.concat([discrete, cut], axis=1)
+            elif self.fields[i].semanticType == 'nominal':
+                # 可能用one-hot，先简单处理
+                discrete = pd.concat([discrete, data[label]], axis=1)
+                factor, _ = pd.factorize(data[label])
+                continuous = pd.concat([continuous, pd.Series(factor).rename(label)], axis=1)
+        return discrete, continuous
+
+    def auto_type(self, data):
+        fields = []
+        for col in data.columns:
+            _type = "Unknown"
+            if data[col].dtype == object:
+                try:
+                    data[col] = pd.to_numeric(data[col], errors='raise')
+                except:
+                    pass
+            if data[col].dtype == np.float64:
+                _type = 'quantitative'
+            elif data[col].dtype == np.int64:
+                # ordinal || quantitative || nominal
+                # 分布较均匀的作为nominal/ordinal， 其余作为quantitative
+                if len(data[col].unique()) < 16:
+                    _type = 'nominal'
+                else:
+                    _type = 'quantitative'
+            else:
+                # maybe temporal
+                _type = 'nominal'
+            fields.append(IFieldMeta(fid=col, name=col, semanticType=_type))
+        return fields
+
+    def __call__(self, X, Y, condition_set=None):
+        xlabel = self.fields[X].fid
+        ylabel = self.fields[Y].fid
+        # print(f'X: {X} Y: {Y} condition_set: {condition_set}')
+        try:
+            if self.fields[X].semanticType == self.fields[Y].semanticType:
+                data = pd.concat([self.data[xlabel], self.data[ylabel]], axis=1)
+                if self.fields[X].semanticType == 'quantitative':
+                    # print('quantitative')
+                    for condition_index in condition_set:
+                        condition = self.fields[condition_index].fid
+                        data = pd.concat([data, self.continuous[condition]], axis=1)
+                    data = data.to_numpy()
+                    cit_api = FisherZ(data)
+                elif self.fields[X].semanticType == 'nominal':
+                    for condition_index in condition_set:
+                        condition = self.fields[condition_index].fid
+                        data = pd.concat([data, self.discrete[condition]], axis=1)
+                    data = data.to_numpy()
+                    cit_api = Chisq_or_Gsq(data, 'chisq')
+            else:
+                if self.prefer == 'discrete':
+                    data = pd.concat([self.discrete[xlabel], self.discrete[ylabel]], axis=1)
+                    for condition_index in condition_set:
+                        condition = self.fields[condition_index].fid
+                        data = pd.concat([data, self.discrete[condition]], axis=1)
+                    data = data.to_numpy()
+                    cit_api = Chisq_or_Gsq(data, 'chisq')
+                else:
+                    data = pd.concat([self.continuous[xlabel], self.continuous[ylabel]], axis=1)
+                    for condition_index in condition_set:
+                        condition = self.fields[condition_index].fid
+                        data = pd.concat([data, self.continuous[condition]], axis=1)
+                    data = data.to_numpy()
+                    cit_api = FisherZ(data)
+        except:
+            print(f'Error: {xlabel} {ylabel} {condition_set}')
+        pvalue = cit_api(0, 1) if condition_set is None else cit_api(0, 1, [i + 2 for i in range(len(condition_set))])
+        return pvalue
+
+
 class FisherZ(CIT_Base):
     def __init__(self, data, **kwargs):
         super().__init__(data, **kwargs)
         self.check_cache_method_consistent('fisherz', NO_SPECIFIED_PARAMETERS_MSG)
         self.assert_input_data_is_valid()
         self.correlation_matrix = np.corrcoef(data.T)
+        self.data = data
 
     def __call__(self, X, Y, condition_set=None):
         '''
@@ -160,14 +284,21 @@ class FisherZ(CIT_Base):
         sub_corr_matrix = self.correlation_matrix[np.ix_(var, var)]
         try:
             inv = np.linalg.inv(sub_corr_matrix)
-        except np.linalg.LinAlgError:
-            raise ValueError('Data correlation matrix is singular. Cannot run fisherz test. Please check your data.')
-        r = -inv[0, 1] / sqrt(inv[0, 0] * inv[1, 1])
-        Z = 0.5 * log((1 + r) / (1 - r))
-        X = sqrt(self.sample_size - len(condition_set) - 3) * abs(Z)
-        p = 2 * (1 - norm.cdf(abs(X)))
+            r = -inv[0, 1] / sqrt(inv[0, 0] * inv[1, 1])
+            Z = 0.5 * log((1 + r) / (1 - r))
+            X = sqrt(self.sample_size - len(condition_set) - 3) * abs(Z)
+            p = 2 * (1 - norm.cdf(abs(X)))
+        except:  # np.linalg.LinAlgError:
+            import math, sys
+            X = math.inf
+            p = 0
+            print('Data correlation matrix is singular. Cannot run fisherz test. Please check your data.',
+                  file=sys.stderr)
+            # raise ValueError('Data correlation matrix is singular. Cannot run fisherz test. Please check your data.')
+
         self.pvalue_cache[cache_key] = p
         return p
+
 
 class KCI(CIT_Base):
     def __init__(self, data, **kwargs):
@@ -192,10 +323,12 @@ class KCI(CIT_Base):
         self.pvalue_cache[cache_key] = p
         return p
 
+
 class Chisq_or_Gsq(CIT_Base):
     def __init__(self, data, method_name, **kwargs):
         def _unique(column):
             return np.unique(column, return_inverse=True)[1]
+
         assert method_name in ['chisq', 'gsq']
         super().__init__(np.apply_along_axis(_unique, 0, data).astype(np.int64), **kwargs)
         self.check_cache_method_consistent(method_name, NO_SPECIFIED_PARAMETERS_MSG)
@@ -211,6 +344,7 @@ class Chisq_or_Gsq(CIT_Base):
         cardSXY: cardinalities of each row (each variable)
         G_sq: True if use G-sq, otherwise (False by default), use Chi_sq
         """
+
         def _Fill2DCountTable(dataXY, cardXY):
             """
             e.g. dataXY: the observed dataset contains 5 samples, on variable x and y they're
@@ -342,6 +476,7 @@ class Chisq_or_Gsq(CIT_Base):
         self.pvalue_cache[cache_key] = p
         return p
 
+
 class MV_FisherZ(CIT_Base):
     def __init__(self, data, **kwargs):
         super().__init__(data, **kwargs)
@@ -387,6 +522,7 @@ class MV_FisherZ(CIT_Base):
         p = 2 * (1 - norm.cdf(abs(X)))
         self.pvalue_cache[cache_key] = p
         return p
+
 
 class MC_FisherZ(CIT_Base):
     def __init__(self, data, **kwargs):
@@ -467,7 +603,8 @@ class D_Separation(CIT_Base):
         super().__init__(data, **kwargs)  # data is just a placeholder, not used in D_Separation
         self.check_cache_method_consistent('d_separation', NO_SPECIFIED_PARAMETERS_MSG)
         self.true_dag = true_dag
-        import networkx as nx; global nx
+        import networkx as nx;
+        global nx
         # import networkx here violates PEP8; but we want to prevent unnecessary import at the top (it's only used here)
 
     def __call__(self, X, Y, condition_set=None):
